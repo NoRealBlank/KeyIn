@@ -26,15 +26,9 @@ parser.add_argument('--epoch_size', type=int, default=600, help='epoch size')
 parser.add_argument('--image_width', type=int, default=64, help='the height / width of the input image to network')
 parser.add_argument('--channels', default=1, type=int)
 parser.add_argument('--dataset', default='smmnist', help='dataset to train with')
-# parser.add_argument('--n_past', type=int, default=5, help='number of frames to condition on')
-# parser.add_argument('--n_future', type=int, default=10, help='number of frames to predict')
-# parser.add_argument('--n_eval', type=int, default=30, help='number of frames to predict at eval time')
 parser.add_argument('--rnn_size', type=int, default=256, help='dimensionality of hidden layer')
-# parser.add_argument('--posterior_rnn_layers', type=int, default=1, help='number of layers')
 parser.add_argument('--inpaintor_rnn_layers', type=int, default=2, help='number of layers')
-# parser.add_argument('--z_dim', type=int, default=10, help='dimensionality of z_t')
 parser.add_argument('--g_dim', type=int, default=128, help='dimensionality of encoder output vector and decoder input vector')
-# parser.add_argument('--beta', type=float, default=0.0001, help='weighting on KL to prior')
 parser.add_argument('--model', default='vgg', help='model type (dcgan | vgg)')
 parser.add_argument('--data_threads', type=int, default=5, help='number of data loading threads')
 parser.add_argument('--num_digits', type=int, default=2, help='number of digits for moving mnist')
@@ -54,8 +48,6 @@ if opt.model_dir != '':
     opt.model_dir = model_dir
     opt.log_dir = '%s/continued' % opt.log_dir
 else:
-    # name = 'model=%s%dx%d-rnn_size=%d-predictor-posterior-rnn_layers=%d-%d-n_past=%d-n_future=%d-lr=%.4f-g_dim=%d-z_dim=%d-last_frame_skip=%d-beta=%.7f%s' % (opt.model, opt.image_width, opt.image_width, opt.rnn_size, opt.predictor_rnn_layers, opt.posterior_rnn_layers, opt.n_past, opt.n_future, opt.lr, opt.g_dim, opt.z_dim, opt.last_frame_skip, opt.beta, opt.name)
-    # name = 'model=%s%dx%d-rnn_size=%d-inpaintor-rnn_layers=%d-n_past=%d-n_future=%d-lr=%.4f-g_dim=%d-last_frame_skip=%d-beta=%.7f-seg_length=%d%s' % (opt.model, opt.image_width, opt.image_width, opt.rnn_size, opt.inpaintor_rnn_layers, opt.n_past, opt.n_future, opt.lr, opt.g_dim, opt.last_frame_skip, opt.beta, opt.seg_length, opt.name)
     name = 'model=%s%dx%d-rnn_size=%d-inpaintor-rnn_layers=%d-lr=%.4f-g_dim=%d-last_frame_skip=%d-seg_length=%d%s' % (opt.model, opt.image_width, opt.image_width, opt.rnn_size, opt.inpaintor_rnn_layers, opt.lr, opt.g_dim, opt.last_frame_skip, opt.seg_length, opt.name)
     if opt.dataset == 'smmnist':
         opt.log_dir = '%s/%s-%d/%s' % (opt.log_dir, opt.dataset, opt.num_digits, name)
@@ -89,15 +81,6 @@ else:
 # ---------------- models ----------------
 import models.lstm as lstm_models
 
-# if opt.model_dir != '':
-#     frame_predictor = saved_model['frame_predictor']
-#     posterior = saved_model['posterior']
-# else:
-#     frame_predictor = lstm_models.lstm(opt.g_dim+opt.z_dim, opt.g_dim, opt.rnn_size, opt.predictor_rnn_layers, opt.batch_size)
-#     posterior = lstm_models.gaussian_lstm(opt.g_dim, opt.z_dim, opt.rnn_size, opt.posterior_rnn_layers, opt.batch_size)
-#     frame_predictor.apply(utils.init_weights)
-#     posterior.apply(utils.init_weights)
-
 if opt.model_dir != '':
     embedder = saved_model['embedder']
     inpaintor = saved_model['inpaintor']
@@ -106,7 +89,6 @@ else:
     inpaintor = lstm_models.lstm(opt.g_dim, opt.g_dim, opt.rnn_size, opt.inpaintor_rnn_layers, opt.batch_size)
     embedder.apply(utils.init_weights)
     inpaintor.apply(utils.init_weights)
-
 
 if opt.model == 'dcgan':
     if opt.image_width == 64:
@@ -130,9 +112,6 @@ else:
     encoder.apply(utils.init_weights)
     decoder.apply(utils.init_weights)
 
-
-# frame_predictor_optimizer = opt.optimizer(frame_predictor.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
-# posterior_optimizer = opt.optimizer(posterior.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
 embedder_optimizer = opt.optimizer(embedder.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
 inpaintor_optimizer = opt.optimizer(inpaintor.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
 encoder_optimizer = opt.optimizer(encoder.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
@@ -140,24 +119,16 @@ decoder_optimizer = opt.optimizer(decoder.parameters(), lr=opt.lr, betas=(opt.be
 
 
 # --------- loss functions ------------------------------------
-# mse_criterion = nn.MSELoss()
-# def kl_criterion(mu, logvar):
-#   # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-#   KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-#   KLD /= opt.batch_size  
-#   return KLD
 bce_criterion = nn.BCELoss()
 
 
 # --------- transfer to gpu ------------------------------------
-# frame_predictor.cuda()
-# posterior.cuda()
 embedder.cuda()
 inpaintor.cuda()
 encoder.cuda()
 decoder.cuda()
-# mse_criterion.cuda()
 bce_criterion.cuda()
+
 
 # --------- load a dataset ------------------------------------
 train_data, test_data = utils.load_dataset(opt)
@@ -189,6 +160,7 @@ def get_testing_batch():
             yield batch 
 testing_batch_generator = get_testing_batch()
 
+
 # --------- plotting funtions ------------------------------------
 def plot(x, epoch):
     nsample = 1 
@@ -204,37 +176,17 @@ def plot(x, epoch):
             delta_key.append(0.2/opt.seg_length)
     delta_key = torch.tensor(delta_key).unsqueeze(0).repeat(opt.batch_size, 1).cuda()
 
-    # h_seq = [encoder(x[i]) for i in range(opt.n_past)]
-
     h_seq = [encoder(x[i]) for i in range(len_in)]
     h_cond = torch.cat([h_seq[0][0], h_seq[len_in-1][0], delta_key], 1)
 
     for s in range(nsample):
-        # frame_predictor.hidden = frame_predictor.init_hidden()
         inpaintor.hidden = inpaintor.cond_hidden(embedder(h_cond))
         gen_seq[s].append(x[0])
         x_in = x[0]
         for i in range(1, len_in-1):
-            # if opt.last_frame_skip or i < opt.n_past:	
-            #     h, skip = h_seq[i-1]
-            #     h = h.detach()
-            # elif i < opt.n_past:
-            #     h, _ = h_seq[i-1]
-            #     h = h.detach()
             if opt.last_frame_skip or i == 1:
                 h, skip = h_seq[i-1]
                 h = h.detach()
-
-            # if i < opt.n_past:
-            #     z_t, _, _ = posterior(h_seq[i][0])
-            #     frame_predictor(torch.cat([h, z_t], 1)) 
-            #     x_in = x[i]
-            #     gen_seq[s].append(x_in)
-            # else:
-            #     z_t = torch.cuda.FloatTensor(opt.batch_size, opt.z_dim).normal_()
-            #     h = frame_predictor(torch.cat([h, z_t], 1)).detach()
-            #     x_in = decoder([h, skip]).detach()
-            #     gen_seq[s].append(x_in)
 
             h = inpaintor(h).detach()
             x_in = decoder([h, skip]).detach()
@@ -284,44 +236,25 @@ def plot_rec(x, epoch):
             delta_key.append(0.2/opt.seg_length)
     delta_key = torch.tensor(delta_key).unsqueeze(0).repeat(opt.batch_size, 1).cuda()
 
-    # frame_predictor.hidden = frame_predictor.init_hidden()
-    # posterior.hidden = posterior.init_hidden()
-    # inpaintor.hidden = inpaintor.init_hidden()
-
-    # h_seq = [encoder(x[i]) for i in range(opt.n_past+opt.n_future)]
     h_seq = [encoder(x[i]) for i in range(len_in)]
     h_cond = torch.cat([h_seq[0][0], h_seq[len_in-1][0], delta_key], 1)
     inpaintor.hidden = inpaintor.cond_hidden(embedder(h_cond))
 
     gen_seq = []
     gen_seq.append(x[0])
-    # x_in = x[0]
     for i in range(1, len_in-1):
-        # h_target = h_seq[i][0].detach()
-        # if opt.last_frame_skip or i < opt.n_past:	
-        #     h, skip = h_seq[i-1]
-        # else:
-        #     h, _ = h_seq[i-1]
-        # h = h.detach()
         if opt.last_frame_skip or i == 1:
             h, skip = h_seq[i-1]
         else:
             h = h_seq[i-1][0]
         h = h.detach()
 
-        # z_t, mu, logvar = posterior(h_target)
-        # if i < opt.n_past:
-        #     frame_predictor(torch.cat([h, z_t], 1)) 
-        #     gen_seq.append(x[i])
-        # else:
-        #     h_pred = frame_predictor(torch.cat([h, z_t], 1)).detach()
-        #     x_pred = decoder([h_pred, skip]).detach()
-        #     gen_seq.append(x_pred)
         h_pred = inpaintor(h).detach()
         x_pred = decoder([h_pred, skip]).detach()
         gen_seq.append(x_pred)
     gen_seq.append(x[len_in-1])
    
+
     to_plot = []
     nrow = min(opt.batch_size, 10)
     for i in range(nrow):
@@ -335,17 +268,10 @@ def plot_rec(x, epoch):
 
 # --------- training funtions ------------------------------------
 def train(x):
-    # frame_predictor.zero_grad()
-    # posterior.zero_grad()
     embedder.zero_grad()
     inpaintor.zero_grad()
     encoder.zero_grad()
     decoder.zero_grad()
-
-    # initialize the hidden state.
-    # frame_predictor.hidden = frame_predictor.init_hidden()
-    # posterior.hidden = posterior.init_hidden()
-    # inpaintor.hidden = inpaintor.init_hidden()
 
     len_in = random.randint(3, 8)
 
@@ -358,57 +284,46 @@ def train(x):
     delta_key = torch.tensor(delta_key).unsqueeze(0).repeat(opt.batch_size, 1).cuda()
     
     h_seq = [encoder(x[i]) for i in range(len_in)]
+    
+    """
+    We condition the inpainting on both keyframe embeddings, κn−1 and κn, 
+     as well as the temporal offset between the two, δn , 
+     by passing these inputs through a multi-layer perceptron 
+     that produces the initial state of the inpainting LSTM.
+    """
     h_cond = torch.cat([h_seq[0][0], h_seq[len_in-1][0], delta_key], 1)
     inpaintor.hidden = inpaintor.cond_hidden(embedder(h_cond))
 
     bce = 0
     for i in range(1, len_in-1):
-        # h_target = h_seq[i][0]
-        # if opt.last_frame_skip or i < opt.n_past:	
-        #     h, skip = h_seq[i-1]
-        # else:
-        #     h = h_seq[i-1][0]
         if opt.last_frame_skip or i == 1:	
             h, skip = h_seq[i-1]
         else:
             h = h_seq[i-1][0]
-        
-        # z_t, mu, logvar = posterior(h_target)
-        # h_pred = frame_predictor(torch.cat([h, z_t], 1))
+
         h_pred = inpaintor(h)
         x_pred = decoder([h_pred, skip])
-
-        # mse += mse_criterion(x_pred, x[i])
-        # kld += kl_criterion(mu, logvar)
 
         # need to change the loss according to the paper
         bce += bce_criterion(x_pred, x[i])
 
-    # loss = mse + kld*opt.beta
     loss = bce
     loss.backward()
 
-    # frame_predictor_optimizer.step()
-    # posterior_optimizer.step()
     embedder_optimizer.step()
     inpaintor_optimizer.step()
     encoder_optimizer.step()
     decoder_optimizer.step()
 
-    # return mse.data.cpu().numpy()/(opt.n_past+opt.n_future), kld.data.cpu().numpy()/(opt.n_future+opt.n_past)
     return bce.data.cpu().numpy()/(len_in-2)
 
 
 # --------- training loop ------------------------------------
 for epoch in range(opt.niter):
-    # frame_predictor.train()
-    # posterior.train()
     embedder.train()
     inpaintor.train()
     encoder.train()
     decoder.train()
-    # epoch_mse = 0
-    # epoch_kld = 0
     epoch_bce = 0
     progress = progressbar.ProgressBar(max_value=opt.epoch_size).start()
     for i in range(opt.epoch_size):
@@ -416,26 +331,18 @@ for epoch in range(opt.niter):
         x = next(training_batch_generator)
 
         # train frame_predictor 
-        # mse, kld = train(x)
-        # epoch_mse += mse
-        # epoch_kld += kld
         bce = train(x)
         epoch_bce += bce
-
 
     progress.finish()
     utils.clear_progressbar()
 
-    # print('[%02d] mse loss: %.5f | kld loss: %.5f (%d)' % (epoch, epoch_mse/opt.epoch_size, epoch_kld/opt.epoch_size, epoch*opt.epoch_size*opt.batch_size))
     print('[%02d] bce loss: %.5f (%d)' % (epoch, epoch_bce/opt.epoch_size, epoch*opt.epoch_size*opt.batch_size))
 
-    # plot some stuff
-    # frame_predictor.eval()
     embedder.eval()
     inpaintor.eval()
     encoder.eval()
     decoder.eval()
-    # posterior.eval()
     x = next(testing_batch_generator)
     plot(x, epoch)
     plot_rec(x, epoch)
@@ -444,8 +351,6 @@ for epoch in range(opt.niter):
     torch.save({
         'encoder': encoder,
         'decoder': decoder,
-        # 'frame_predictor': frame_predictor,
-        # 'posterior': posterior,
         'embedder': embedder,
         'inpaintor': inpaintor,
         'opt': opt},

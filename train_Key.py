@@ -16,7 +16,10 @@ parser.add_argument('--lr', default=0.0002, type=float, help='learning rate')
 parser.add_argument('--beta1', default=0.9, type=float, help='momentum term for adam')
 parser.add_argument('--batch_size', default=100, type=int, help='batch size')
 parser.add_argument('--log_dir', default='logs/fp', help='base directory to save logs')
-parser.add_argument('--model_dir', default='', help='base directory to save logs')
+
+parser.add_argument('--pred_model_dir', default='', help='base directory to save logs')
+parser.add_argument('--inpt_model_dir', default='', help='inpaintor model directory')
+
 parser.add_argument('--name', default='', help='identifier for directory')
 parser.add_argument('--data_root', default='data', help='root directory for data')
 parser.add_argument('--optimizer', default='adam', help='optimizer to train with')
@@ -27,18 +30,15 @@ parser.add_argument('--image_width', type=int, default=64, help='the height / wi
 parser.add_argument('--channels', default=1, type=int)
 parser.add_argument('--dataset', default='smmnist', help='dataset to train with')
 
-# parser.add_argument('--n_past', type=int, default=5, help='number of frames to condition on')
-# parser.add_argument('--n_future', type=int, default=10, help='number of frames to predict')
-# parser.add_argument('--n_eval', type=int, default=30, help='number of frames to predict at eval time')
 parser.add_argument('--n_cond', type=int, default=5, help='number of frames to condition on')
 
 parser.add_argument('--rnn_size', type=int, default=256, help='dimensionality of hidden layer')
-parser.add_argument('--posterior_rnn_layers', type=int, default=1, help='number of layers')
+parser.add_argument('--posterior_rnn_layers', type=int, default=2, help='number of layers')
 parser.add_argument('--predictor_rnn_layers', type=int, default=2, help='number of layers')
 parser.add_argument('--z_dim', type=int, default=10, help='dimensionality of z_t')
 parser.add_argument('--g_dim', type=int, default=128, help='dimensionality of encoder output vector and decoder input vector')
-parser.add_argument('--beta', type=float, default=0.0001, help='weighting on KL to prior')
-parser.add_argument('--model', default='dcgan', help='model type (dcgan | vgg)')
+
+parser.add_argument('--model', default='vgg', help='model type (dcgan | vgg)')
 parser.add_argument('--data_threads', type=int, default=5, help='number of data loading threads')
 parser.add_argument('--num_digits', type=int, default=2, help='number of digits for moving mnist')
 parser.add_argument('--last_frame_skip', action='store_true', help='if true, skip connections go between frame t and frame t+t rather than last ground truth frame')
@@ -49,9 +49,18 @@ parser.add_argument('--seg_length', type=int, default=10, help='max offsets betw
 # KeyIn
 parser.add_argument('--pred_horizon', type=int, default=30, help='number of frames to process for discovering keyframes')
 
+parser.add_argument('--keyframe_num', type=int, default=6, help='number of keyframes to predict')
+
+parser.add_argument('--beta_kld', type=float, default=0.001, help='weighting on KL to prior')
+parser.add_argument('--beta_inpaint', type=float, default=0.05, help='weighting on inpainting loss')
+
 
 opt = parser.parse_args()
-if opt.model_dir != '':
+
+assert opt.inpt_model_dir != '', "inpt_model_dir must be specified!"
+saved_inpaintor = torch.load('%s/model.pth' % opt.inpt_model_dir)['inpaintor']
+
+if opt.pred_model_dir != '':
     saved_model = torch.load('%s/model.pth' % opt.model_dir)
     optimizer = opt.optimizer
     model_dir = opt.model_dir
@@ -60,7 +69,7 @@ if opt.model_dir != '':
     opt.model_dir = model_dir
     opt.log_dir = '%s/continued' % opt.log_dir
 else:
-    name = 'model=%s%dx%d-rnn_size=%d-predictor-posterior-rnn_layers=%d-%d-n_past=%d-n_future=%d-lr=%.4f-g_dim=%d-z_dim=%d-last_frame_skip=%d-beta=%.7f%s' % (opt.model, opt.image_width, opt.image_width, opt.rnn_size, opt.predictor_rnn_layers, opt.posterior_rnn_layers, opt.n_past, opt.n_future, opt.lr, opt.g_dim, opt.z_dim, opt.last_frame_skip, opt.beta, opt.name)
+    name = 'model=%s%dx%d-rnn_size=%d-predictor-posterior-rnn_layers=%d-%d-n_cond=%d-lr=%.4f-g_dim=%d-z_dim=%d-last_frame_skip=%d-beta=%.7f%s' % (opt.model, opt.image_width, opt.image_width, opt.rnn_size, opt.predictor_rnn_layers, opt.posterior_rnn_layers, opt.n_cond, opt.lr, opt.g_dim, opt.z_dim, opt.last_frame_skip, opt.beta, opt.name)
     if opt.dataset == 'smmnist':
         opt.log_dir = '%s/%s-%d/%s' % (opt.log_dir, opt.dataset, opt.num_digits, name)
     else:
@@ -77,7 +86,6 @@ dtype = torch.cuda.FloatTensor
 
 
 # ---------------- load the models  ----------------
-
 print(opt)
 
 # ---------------- optimizers ----------------
@@ -90,58 +98,68 @@ elif opt.optimizer == 'sgd':
 else:
     raise ValueError('Unknown optimizer: %s' % opt.optimizer)
 
+# ---------------- models ----------------
+embedder = saved_inpaintor['embedder']
+inpaintor = saved_inpaintor['inpaintor']
+encoder = saved_inpaintor['encoder']
+decoder = saved_inpaintor['decoder']
+
+def freeze_parameters(model):
+    for param in model.parameters():
+        param.requires_grad = False
+
+freeze_parameters(embedder)
+freeze_parameters(inpaintor)
+freeze_parameters(encoder)
+freeze_parameters(decoder)
+
+
 import models.lstm as lstm_models
-if opt.model_dir != '':
-    frame_predictor = saved_model['frame_predictor']
-    posterior = saved_model['posterior']
-else:
-    frame_predictor = lstm_models.lstm(opt.g_dim+opt.z_dim, opt.g_dim, opt.rnn_size, opt.predictor_rnn_layers, opt.batch_size)
-    posterior = lstm_models.gaussian_lstm(opt.g_dim, opt.z_dim, opt.rnn_size, opt.posterior_rnn_layers, opt.batch_size)
-    frame_predictor.apply(utils.init_weights)
-    posterior.apply(utils.init_weights)
 
-if opt.model == 'dcgan':
-    if opt.image_width == 64:
-        import models.dcgan_64 as model 
-    elif opt.image_width == 128:
-        import models.dcgan_128 as model  
-elif opt.model == 'vgg':
-    if opt.image_width == 64:
-        import models.vgg_64 as model
-    elif opt.image_width == 128:
-        import models.vgg_128 as model
+if opt.key_model_dir != '':
+    keyframe_conditioner = saved_model['keyframe_conditioner']
+    keyframe_predictor = saved_model['keyframe_predictor']
+    KeyValue_posterior = saved_model['KeyValue_posterior']
 else:
-    raise ValueError('Unknown model: %s' % opt.model)
-        
-if opt.model_dir != '':
-    decoder = saved_model['decoder']
-    encoder = saved_model['encoder']
-else:
-    encoder = model.encoder(opt.g_dim, opt.channels)
-    decoder = model.decoder(opt.g_dim, opt.channels)
-    encoder.apply(utils.init_weights)
-    decoder.apply(utils.init_weights)
+    keyframe_conditioner = lstm_models.lstm(opt.g_dim, opt.g_dim, opt.rnn_size, opt.predictor_rnn_layers, opt.batch_size)
+    keyframe_predictor = lstm_models.keyframe_lstm(opt.z_dim, opt.g_dim, opt.seg_length, opt.rnn_size, opt.predictor_rnn_layers, opt.batch_size)
+    KeyValue_posterior = lstm_models.KeyValue_lstm(opt.g_dim, opt.g_dim, opt.z_dim, opt.rnn_size, opt.posterior_rnn_layers, opt.batch_size)
+    keyframe_conditioner.apply(utils.init_weights)
+    keyframe_predictor.apply(utils.init_weights)
+    KeyValue_posterior.apply(utils.init_weights)
 
-frame_predictor_optimizer = opt.optimizer(frame_predictor.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
-posterior_optimizer = opt.optimizer(posterior.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
-encoder_optimizer = opt.optimizer(encoder.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
-decoder_optimizer = opt.optimizer(decoder.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
+attention = lstm_models.KeyValueAttention(opt.g_dim, opt.z_dim)
+
+def reparameterize(mu, logvar):
+    logvar = logvar.mul(0.5).exp_()
+    eps = Variable(logvar.data.new(logvar.size()).normal_())
+    return eps.mul(logvar).add_(mu)
+
+keyframe_conditioner_optimizer = opt.optimizer(keyframe_conditioner.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
+keyframe_predictor_optimizer = opt.optimizer(keyframe_predictor.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
+KeyValue_posterior_optimizer = opt.optimizer(KeyValue_posterior.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
+
 
 # --------- loss functions ------------------------------------
-mse_criterion = nn.MSELoss()
+bce_criterion = nn.BCELoss()
+
 def kl_criterion(mu, logvar):
-  # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-  KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-  KLD /= opt.batch_size  
-  return KLD
+  # keep the batch dimension
+  return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
 
 
 # --------- transfer to gpu ------------------------------------
-frame_predictor.cuda()
-posterior.cuda()
+embedder.cuda()
+inpaintor.cuda()
 encoder.cuda()
 decoder.cuda()
-mse_criterion.cuda()
+
+keyframe_conditioner.cuda()
+keyframe_predictor.cuda()
+KeyValue_posterior.cuda()
+attention.cuda()
+bce_criterion.cuda()
+
 
 # --------- load a dataset ------------------------------------
 train_data, test_data = utils.load_dataset(opt)
@@ -173,6 +191,7 @@ def get_testing_batch():
             yield batch 
 testing_batch_generator = get_testing_batch()
 
+
 # --------- plotting funtions ------------------------------------
 def plot(x, epoch):
     nsample = 5 
@@ -201,6 +220,7 @@ def plot(x, epoch):
                 h = frame_predictor(torch.cat([h, z_t], 1)).detach()
                 x_in = decoder([h, skip]).detach()
                 gen_seq[s].append(x_in)
+
 
     to_plot = []
     gifs = [ [] for t in range(opt.n_eval) ]
@@ -254,6 +274,7 @@ def plot_rec(x, epoch):
             x_pred = decoder([h_pred, skip]).detach()
             gen_seq.append(x_pred)
    
+
     to_plot = []
     nrow = min(opt.batch_size, 10)
     for i in range(nrow):
@@ -267,82 +288,213 @@ def plot_rec(x, epoch):
 
 # --------- training funtions ------------------------------------
 def train(x):
-    frame_predictor.zero_grad()
-    posterior.zero_grad()
+    embedder.zero_grad()
+    inpaintor.zero_grad()
     encoder.zero_grad()
     decoder.zero_grad()
+    keyframe_conditioner.zero_grad()
+    keyframe_predictor.zero_grad()
+    KeyValue_posterior.zero_grad()
 
     # initialize the hidden state.
-    frame_predictor.hidden = frame_predictor.init_hidden()
-    posterior.hidden = posterior.init_hidden()
+    keyframe_conditioner.hidden = keyframe_conditioner.init_hidden()
+    keyframe_predictor.hidden = keyframe_predictor.init_hidden()
+    KeyValue_posterior.hidden = KeyValue_posterior.init_hidden()
 
-    h_seq = [encoder(x[i]) for i in range(opt.n_past+opt.n_future)]
-    mse = 0
-    kld = 0
-    for i in range(1, opt.n_past+opt.n_future):
-        h_target = h_seq[i][0]
-        if opt.last_frame_skip or i < opt.n_past:	
-            h, skip = h_seq[i-1]
-        else:
-            h = h_seq[i-1][0]
-        z_t, mu, logvar = posterior(h_target)
-        h_pred = frame_predictor(torch.cat([h, z_t], 1))
-        x_pred = decoder([h_pred, skip])
-        mse += mse_criterion(x_pred, x[i])
-        kld += kl_criterion(mu, logvar)
+    h_seq = [encoder(x[i]) for i in range(max(opt.n_cond + opt.pred_horizon, opt.n_cond + opt.keyframe_num * opt.seg_length))]
+    
+    # to pallarelize the computation
+    gen_seq = [[] for i in range(opt.keyframe_num + 1)]
 
-    loss = mse + kld*opt.beta
+    """
+    To condition the keyframe predictor on past frames, 
+     we initialize its state with the final state of another LSTM 
+     that processes the conditioning frames.
+    """
+    for i in range(opt.n_cond):
+        keyframe_conditioner(h_seq[i][0])
+    keyframe_predictor.hidden = keyframe_conditioner.hidden
+    
+    # TODO: They didn't say how to condition the posterior on past frames.
+    # KeyValue_posterior.hidden = keyframe_conditioner.hidden
+
+    # inference the future keyframes
+    key_set = [[] for i in range(opt.pred_horizon)]
+    value_mu_set = [[] for i in range(opt.pred_horizon)]
+    value_logvar_set = [[] for i in range(opt.pred_horizon)]
+    for i in range(opt.n_cond, opt.n_cond + opt.pred_horizon):
+        # inverse inference flow
+        index = opt.n_cond + opt.n_cond + opt.pred_horizon - i - 1
+        key, value_mu, value_logvar = KeyValue_posterior(h_seq[index][0])
+        key_set[index - opt.n_cond] = key
+        value_mu_set[index - opt.n_cond] = value_mu
+        value_logvar_set[index - opt.n_cond] = value_logvar
+    
+    # change shape to [batch_size, num_keys, key_dim or value_dim]
+    key_set.transpose(0, 1)
+    value_mu_set.transpose(0, 1)
+    value_logvar_set.transpose(0, 1)
+
+    keyframes = [[] for i in range(opt.keyframe_num + 1)]
+    keyframes[0] = x[opt.n_cond - 1]
+    keyframes_embed = [[] for i in range(opt.keyframe_num + 1)]
+
+    # TODO: think out how to set the skip connection?
+    keyframes_embed[0], keyframe_skip = encoder(keyframes[0])
+
+    delta_set = [[] for i in range(opt.keyframe_num + 1)]
+    delta_set[0] = torch.zeros(opt.batch_size, opt.seg_length)
+
+    # TODO: consider its size
+    index_set = torch.full((opt.keyframe_num + 1, opt.batch_size), fill_value=opt.n_cond-1, dtype=torch.int)
+    
+    # generate keyframes and inpaint the frames between them
+    kld_set = [torch.zeros(opt.batch_size)]
+    for i in range(1, opt.keyframe_num + 1):
+        # get the prior distribution of the latent variable
+        mu = attention(keyframes_embed[i-1], key_set, value_mu_set)
+        logvar = attention(keyframes_embed[i-1], key_set, value_logvar_set)
+        z_t = reparameterize(mu, logvar)
+
+        # predict the next keyframe
+        keyframes_embed[i], delta_set[i] = keyframe_predictor(z_t)
+        keyframes[i] = decoder([keyframes_embed[i], keyframe_skip])
+
+        # TODO: consider the case where index_set[i] > horizon
+        # just set it to the last frame？
+        index_set[i] = index_set[i-1] + torch.argmax(delta_set[i], dim=1) + 1
+
+        # loss for keyframe prior
+        kld_set.append(kl_criterion(mu, logvar))
+
+        # inpaint the frames between the keyframes
+        h_cond = torch.cat([keyframes_embed[i-1], keyframes_embed[i], delta_set[i]], 1)
+        inpaintor.hidden = inpaintor.condition(embedder(h_cond))
+
+        # TODO: consider the index difference between the index_set[i-1] batch
+        for j in range(opt.seg_length):
+            if j == 0:
+                h, skip = encoder(keyframes[i-1])
+
+            h = inpaintor(h)
+            x_pred = decoder([h, skip])
+            gen_seq.append(x_pred)
+    
+    """
+    Convert distributions of interframe offsets δ n to keyframe timesteps τ n
+    """
+    tau_set = torch.zeros(opt.keyframe_num + 1, opt.batch_size, opt.pred_horizon)
+    tau_set[1, :, 0:opt.seg_length] = delta_set[1]
+    for t in range(1, opt.pred_horizon):
+        for n in range(2, opt.keyframe_num + 1):
+            for j in range(min(opt.seg_length, t)):
+                tau_set[n, :, t] += tau_set[n-1, :, t-1-j] * delta_set[n, :, j]
+    
+    """
+    Compute probabilities of keyframes being within the predicted sequence
+    """
+    c_set = torch.zeros(opt.keyframe_num + 1, opt.batch_size)
+    for n in range(1, opt.keyframe_num + 1):
+        c_set[n] = torch.sum(tau_set[n], dim=1)
+
+    """
+    Compute soft keyframe targets
+    """
+    keyframe_target = [[] for i in opt.keyframe_num + 1]
+    for n in range(1, opt.keyframe_num + 1):
+        keyframe_target[n] = torch.einsum('ib...,bi->b...', x[opt.cond:opt.cond + opt.pred_horizon], tau_set[n])
+
+    """
+    Compute the keyframe loss
+    """
+    bce_keyframe = bce_criterion(keyframes, keyframe_target, weight=c_set.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1))
+    kld = torch.sum(kld_set * c_set) / torch.sum(c_set)
+
+    """
+    Get probabilities of segments ending after particular frames
+    """
+    p_end = torch.zeros(opt.keyframe_num + 1, opt.batch_size, opt.seg_length)
+    for n in range(1, opt.keyframe_num + 1):
+        for t in range(opt.seg_length):
+            p_end[n, :, t] = torch.sum(delta_set[n, :, t:opt.seg_length], dim=1)
+    
+    """
+    Get distributions of individual frames’ timesteps
+    """
+    p_frame = torch.zeros(opt.keyframe_num + 1, opt.batch_size, opt.pred_horizon, opt.seg_length)
+    for n in range(1, opt.keyframe_num + 1):
+        for t in range(opt.pred_horizon):
+            for j in range(min(opt.seg_length, t)):
+                p_frame[n, :, t, j] = tau_set[n-1, :, t-1-j] * p_end[n, :, j]
+
+    """
+    Compute soft individual frames
+    """
+    frame_soft = [[] for i in opt.horizon]
+    for i in range(opt.pred_horizon):
+        frame_soft[i] = torch.einsum('nbj,njb...->b...', p_frame[:, :, i, :], gen_seq)
+
+    """
+    Compute the inpainting loss
+    """
+    bce_inpaint = bce_criterion(frame_soft, x[opt.cond:opt.cond + opt.pred_horizon])
+
+    """
+    Compute total sequence loss
+    """
+    loss = bce_keyframe + opt.beta_kld * kld + opt.beta_inpaint * bce_inpaint
+
     loss.backward()
 
-    frame_predictor_optimizer.step()
-    posterior_optimizer.step()
-    encoder_optimizer.step()
-    decoder_optimizer.step()
+    keyframe_conditioner_optimizer.step()
+    keyframe_predictor_optimizer.step()
+    KeyValue_posterior_optimizer.step()
 
-    return mse.data.cpu().numpy()/(opt.n_past+opt.n_future), kld.data.cpu().numpy()/(opt.n_future+opt.n_past)
+    return bce_keyframe.data.cpu().numpy(), kld.data.cpu().numpy(), bce_inpaint.data.cpu().numpy()
+
 
 # --------- training loop ------------------------------------
 for epoch in range(opt.niter):
-    frame_predictor.train()
-    posterior.train()
-    encoder.train()
-    decoder.train()
-    epoch_mse = 0
+    keyframe_conditioner.train()
+    keyframe_predictor.train()
+    KeyValue_posterior.train()
+
+    epoch_bce_keyframe = 0
     epoch_kld = 0
+    epoch_bce_inpaint = 0
     progress = progressbar.ProgressBar(max_value=opt.epoch_size).start()
     for i in range(opt.epoch_size):
         progress.update(i+1)
         x = next(training_batch_generator)
 
-        # train frame_predictor 
-        mse, kld = train(x)
-        epoch_mse += mse
+        # train the predictor
+        bce_keyframe, kld, bce_inpaint = train(x)
+        epoch_bce_keyframe += bce_keyframe
         epoch_kld += kld
-
+        epoch_bce_inpaint += bce_inpaint
 
     progress.finish()
     utils.clear_progressbar()
 
-    print('[%02d] mse loss: %.5f | kld loss: %.5f (%d)' % (epoch, epoch_mse/opt.epoch_size, epoch_kld/opt.epoch_size, epoch*opt.epoch_size*opt.batch_size))
+    print('[%02d] bce_keyframe loss: %.5f | kld loss: %.5f | bce_inpaint loss: %.5f (%d)' % (epoch, epoch_bce_keyframe/opt.epoch_size, epoch_kld/opt.epoch_size, epoch_bce_inpaint/opt.epoch_size, epoch*opt.epoch_size*opt.batch_size))
 
     # plot some stuff
-    frame_predictor.eval()
-    encoder.eval()
-    decoder.eval()
-    posterior.eval()
+    keyframe_conditioner.eval()
+    keyframe_predictor.eval()
+    KeyValue_posterior.eval()
     x = next(testing_batch_generator)
     plot(x, epoch)
     plot_rec(x, epoch)
 
     # save the model
     torch.save({
-        'encoder': encoder,
-        'decoder': decoder,
-        'frame_predictor': frame_predictor,
-        'posterior': posterior,
+        'keyframe_conditioner': keyframe_conditioner,
+        'keyframe_predictor': keyframe_predictor,
+        'KeyValue_posterior': KeyValue_posterior,
         'opt': opt},
         '%s/model.pth' % opt.log_dir)
-    if epoch % 10 == 0:
+    
+    if (epoch + 1) % 10 == 0:
         print('log dir: %s' % opt.log_dir)
         
 
