@@ -4,3 +4,5 @@
 /data/__pycache__/
 /models/__pycache__/
 /.idea/
+/__pycache__/
+/pretrained_models/
