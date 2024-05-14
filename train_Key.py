@@ -63,13 +63,16 @@ assert opt.inpt_model_dir != '', "inpt_model_dir must be specified!"
 saved_inpaintor = torch.load('%s/model.pth' % opt.inpt_model_dir)
 
 if opt.pred_model_dir != '':
-    saved_model = torch.load('%s/model.pth' % opt.model_dir)
+    saved_model = torch.load('%s/model.pth' % opt.pred_model_dir)
     optimizer = opt.optimizer
-    model_dir = opt.model_dir
+    model_dir = opt.pred_model_dir
     opt = saved_model['opt']
     opt.optimizer = optimizer
     opt.model_dir = model_dir
     opt.log_dir = '%s/continued' % opt.log_dir
+
+    opt.batch_size = 2
+    opt.epoch_size = 10
 else:
     name = 'model=%s%dx%d-rnn_size=%d-predictor-posterior-rnn_layers=%d-%d-n_cond=%d-lr=%.4f-g_dim=%d-z_dim=%d-last_frame_skip=%d-beta_kld=%.7f-beta_inpaint=%.7f-keyframe_num=%d-pred_horizon=%d-seg_length=%d%s' % (opt.model, opt.image_width, opt.image_width, opt.rnn_size, opt.predictor_rnn_layers, opt.posterior_rnn_layers, opt.n_cond, opt.lr, opt.g_dim, opt.z_dim, opt.last_frame_skip, opt.beta_kld, opt.beta_inpaint, opt.keyframe_num, opt.pred_horizon, opt.seg_length, opt.name)
     if opt.dataset == 'smmnist':
@@ -195,96 +198,167 @@ testing_batch_generator = get_testing_batch()
 
 # --------- plotting funtions ------------------------------------
 def plot(x, epoch):
-    nsample = 5 
-    gen_seq = [[] for i in range(nsample)]
-    gt_seq = [x[i] for i in range(len(x))]
+    nsample = 3
+    show_seq = [[[] for b in range(opt.batch_size)] for i in range(nsample)]
+    gt_seq = [x[i] for i in range(opt.n_cond + opt.pred_horizon)]
 
-    h_seq = [encoder(x[i]) for i in range(opt.n_past)]
+    h_seq = [encoder(x[i]) for i in range(opt.n_cond + opt.pred_horizon)]
     for s in range(nsample):
-        frame_predictor.hidden = frame_predictor.init_hidden()
-        gen_seq[s].append(x[0])
-        x_in = x[0]
-        for i in range(1, opt.n_eval):
-            if opt.last_frame_skip or i < opt.n_past:	
-                h, skip = h_seq[i-1]
-                h = h.detach()
-            elif i < opt.n_past:
-                h, _ = h_seq[i-1]
-                h = h.detach()
-            if i < opt.n_past:
-                z_t, _, _ = posterior(h_seq[i][0])
-                frame_predictor(torch.cat([h, z_t], 1)) 
-                x_in = x[i]
-                gen_seq[s].append(x_in)
-            else:
-                z_t = torch.cuda.FloatTensor(opt.batch_size, opt.z_dim).normal_()
-                h = frame_predictor(torch.cat([h, z_t], 1)).detach()
-                x_in = decoder([h, skip]).detach()
-                gen_seq[s].append(x_in)
+        gen_seq = [[] for i in range(opt.keyframe_num + 1)]
+        gen_seq[0] = torch.zeros(opt.seg_length, opt.batch_size, opt.channels, opt.image_width, opt.image_width).cuda()
 
+        # initialize the hidden state.
+        keyframe_conditioner.hidden = keyframe_conditioner.init_hidden()
+        keyframe_predictor.hidden = keyframe_predictor.init_hidden()
+        KeyValue_posterior.hidden = KeyValue_posterior.init_hidden()
+
+        # condition the keyframe predictor on past frames
+        for i in range(opt.n_cond):
+            keyframe_conditioner(h_seq[i][0])
+        keyframe_predictor.hidden = keyframe_conditioner.hidden
+
+        # inference the future keyframes
+        key_set = [[] for i in range(opt.pred_horizon)]
+        value_mu_set = [[] for i in range(opt.pred_horizon)]
+        value_logvar_set = [[] for i in range(opt.pred_horizon)]
+        for i in range(opt.n_cond, opt.n_cond + opt.pred_horizon):
+            # inverse inference flow
+            index = opt.n_cond + opt.n_cond + opt.pred_horizon - i - 1
+            key, value_mu, value_logvar = KeyValue_posterior(h_seq[index][0])
+            key_set[index - opt.n_cond] = key
+            value_mu_set[index - opt.n_cond] = value_mu
+            value_logvar_set[index - opt.n_cond] = value_logvar
+
+        # change shape to [batch_size, num_keys, key_dim or value_dim]
+        key_set = torch.stack(key_set).transpose(0, 1)
+        value_mu_set = torch.stack(value_mu_set).transpose(0, 1)
+        value_logvar_set = torch.stack(value_logvar_set).transpose(0, 1)
+
+        keyframes = [[] for i in range(opt.keyframe_num + 1)]
+        keyframes[0] = x[opt.n_cond - 1]
+        keyframes_embed = [[] for i in range(opt.keyframe_num + 1)]
+
+        keyframes_embed[0], keyframe_skip = encoder(keyframes[0])
+
+        delta_set = [[] for i in range(opt.keyframe_num + 1)]
+        delta_set[0] = torch.zeros(opt.batch_size, opt.seg_length)
+
+        index_set = torch.full((opt.keyframe_num + 1, opt.batch_size),
+                               fill_value=opt.n_cond-1, dtype=torch.int).cuda()
+
+        # generate keyframes and inpaint the frames between them
+        for i in range(1, opt.keyframe_num + 1):
+            # get the prior distribution of the latent variable
+            mu = attention(keyframes_embed[i - 1], key_set, value_mu_set)
+            logvar = attention(keyframes_embed[i - 1], key_set, value_logvar_set)
+            z_t = reparameterize(mu, logvar)
+
+            # predict the next keyframe
+            keyframes_embed[i], delta_set[i] = keyframe_predictor(z_t)
+            keyframes[i] = decoder([keyframes_embed[i], keyframe_skip])
+
+            # TODO: consider the case where index_set[i] > horizon
+            # just set it to the last frame？
+            index_set[i] = index_set[i - 1] + torch.argmax(delta_set[i], dim=1) + 1
+
+            # inpaint the frames between the keyframes
+            h_cond = torch.cat([keyframes_embed[i - 1], keyframes_embed[i], delta_set[i]], 1)
+            inpaintor.hidden = inpaintor.cond_hidden(embedder(h_cond))
+
+            # TODO: consider the index difference between the index_set[i-1] batch
+            for j in range(opt.seg_length):
+                if j == 0:
+                    h, skip = encoder(keyframes[i - 1])
+
+                h = inpaintor(h)
+                x_pred = decoder([h, skip])
+                gen_seq[i].append(x_pred)
+
+        # get show seq with different segment length
+        border_width = 2
+        for b in range(opt.batch_size):
+            for i in range(opt.n_cond):
+                show_seq[s][b].append(x[i][b])
+
+            for i in range(1, opt.keyframe_num + 1):
+                seg_length = torch.argmax(delta_set[i][b])
+                for j in range(seg_length):
+                    show_seq[s][b].append(gen_seq[i][j][b])
+
+                # add border to the keyframe
+                kf = keyframes[i][b]
+                kf[:, :border_width, :] = 1  # top
+                kf[:, -border_width:, :] = 1  # bottom
+                kf[:, :, :border_width] = 1  # left
+                kf[:, :, -border_width:] = 1  # right
+                show_seq[s][b].append(kf)
 
     to_plot = []
-    gifs = [ [] for t in range(opt.n_eval) ]
+    # gifs = [[] for t in range(opt.n_cond + opt.pred_horizon)]
     nrow = min(opt.batch_size, 10)
     for i in range(nrow):
         # ground truth sequence
-        row = [] 
-        for t in range(opt.n_eval):
+        row = []
+        for t in range(opt.n_cond + opt.pred_horizon):
             row.append(gt_seq[t][i])
         to_plot.append(row)
 
         for s in range(nsample):
             row = []
-            for t in range(opt.n_eval):
-                row.append(gen_seq[s][t][i]) 
+            seg_length = min(opt.n_cond + opt.pred_horizon, len(show_seq[s][i]))
+            for t in range(seg_length):
+                row.append(show_seq[s][i][t])
+            for t in range(seg_length, opt.n_cond + opt.pred_horizon):
+                row.append(torch.zeros(opt.channels, opt.image_width, opt.image_width).cuda())
             to_plot.append(row)
-        for t in range(opt.n_eval):
-            row = []
-            row.append(gt_seq[t][i])
-            for s in range(nsample):
-                row.append(gen_seq[s][t][i])
-            gifs[t].append(row)
+
+        # for t in range(opt.n_cond + opt.pred_horizon):
+        #     row = []
+        #     row.append(gt_seq[t][i])
+        #     for s in range(nsample):
+        #         row.append(show_seq[s][i][t])
+        #     gifs[t].append(row)
 
     fname = '%s/gen/sample_%d.png' % (opt.log_dir, epoch) 
     utils.save_tensors_image(fname, to_plot)
 
-    fname = '%s/gen/sample_%d.gif' % (opt.log_dir, epoch) 
-    utils.save_gif(fname, gifs)
+    # fname = '%s/gen/sample_%d.gif' % (opt.log_dir, epoch)
+    # utils.save_gif(fname, gifs)
 
 
-def plot_rec(x, epoch):
-    frame_predictor.hidden = frame_predictor.init_hidden()
-    posterior.hidden = posterior.init_hidden()
-    gen_seq = []
-    gen_seq.append(x[0])
-    x_in = x[0]
-    h_seq = [encoder(x[i]) for i in range(opt.n_past+opt.n_future)]
-    for i in range(1, opt.n_past+opt.n_future):
-        h_target = h_seq[i][0].detach()
-        if opt.last_frame_skip or i < opt.n_past:	
-            h, skip = h_seq[i-1]
-        else:
-            h, _ = h_seq[i-1]
-        h = h.detach()
-        z_t, mu, logvar = posterior(h_target)
-        if i < opt.n_past:
-            frame_predictor(torch.cat([h, z_t], 1)) 
-            gen_seq.append(x[i])
-        else:
-            h_pred = frame_predictor(torch.cat([h, z_t], 1)).detach()
-            x_pred = decoder([h_pred, skip]).detach()
-            gen_seq.append(x_pred)
-   
-
-    to_plot = []
-    nrow = min(opt.batch_size, 10)
-    for i in range(nrow):
-        row = []
-        for t in range(opt.n_past+opt.n_future):
-            row.append(gen_seq[t][i]) 
-        to_plot.append(row)
-    fname = '%s/gen/rec_%d.png' % (opt.log_dir, epoch) 
-    utils.save_tensors_image(fname, to_plot)
+# def plot_rec(x, epoch):
+#     frame_predictor.hidden = frame_predictor.init_hidden()
+#     posterior.hidden = posterior.init_hidden()
+#     gen_seq = []
+#     gen_seq.append(x[0])
+#     x_in = x[0]
+#     h_seq = [encoder(x[i]) for i in range(opt.n_past+opt.n_future)]
+#     for i in range(1, opt.n_past+opt.n_future):
+#         h_target = h_seq[i][0].detach()
+#         if opt.last_frame_skip or i < opt.n_past:
+#             h, skip = h_seq[i-1]
+#         else:
+#             h, _ = h_seq[i-1]
+#         h = h.detach()
+#         z_t, mu, logvar = posterior(h_target)
+#         if i < opt.n_past:
+#             frame_predictor(torch.cat([h, z_t], 1))
+#             gen_seq.append(x[i])
+#         else:
+#             h_pred = frame_predictor(torch.cat([h, z_t], 1)).detach()
+#             x_pred = decoder([h_pred, skip]).detach()
+#             gen_seq.append(x_pred)
+#
+#
+#     to_plot = []
+#     nrow = min(opt.batch_size, 10)
+#     for i in range(nrow):
+#         row = []
+#         for t in range(opt.n_past+opt.n_future):
+#             row.append(gen_seq[t][i])
+#         to_plot.append(row)
+#     fname = '%s/gen/rec_%d.png' % (opt.log_dir, epoch)
+#     utils.save_tensors_image(fname, to_plot)
 
 
 # --------- training funtions ------------------------------------
@@ -348,7 +422,8 @@ def train(x):
     delta_set[0] = torch.zeros(opt.batch_size, opt.seg_length)
 
     # TODO: consider its size
-    index_set = torch.full((opt.keyframe_num + 1, opt.batch_size), fill_value=opt.n_cond-1, dtype=torch.int).cuda()
+    index_set = torch.full((opt.keyframe_num + 1, opt.batch_size),
+                           fill_value=opt.n_cond-1, dtype=torch.int).cuda()
     
     # generate keyframes and inpaint the frames between them
     kld_set = [torch.zeros(opt.batch_size).cuda()]
@@ -508,8 +583,8 @@ for epoch in range(opt.niter):
     keyframe_conditioner.eval()
     keyframe_predictor.eval()
     KeyValue_posterior.eval()
-    # x = next(testing_batch_generator)
-    # plot(x, epoch)
+    x = next(testing_batch_generator)
+    plot(x, epoch)
     # plot_rec(x, epoch)
 
     # save the model
