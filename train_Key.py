@@ -1,4 +1,6 @@
 import torch
+# torch.autograd.set_detect_anomaly(True)
+
 import torch.optim as optim
 import torch.nn as nn
 import argparse
@@ -58,7 +60,7 @@ parser.add_argument('--beta_inpaint', type=float, default=0.05, help='weighting 
 opt = parser.parse_args()
 
 assert opt.inpt_model_dir != '', "inpt_model_dir must be specified!"
-saved_inpaintor = torch.load('%s/model.pth' % opt.inpt_model_dir)['inpaintor']
+saved_inpaintor = torch.load('%s/model.pth' % opt.inpt_model_dir)
 
 if opt.pred_model_dir != '':
     saved_model = torch.load('%s/model.pth' % opt.model_dir)
@@ -69,7 +71,7 @@ if opt.pred_model_dir != '':
     opt.model_dir = model_dir
     opt.log_dir = '%s/continued' % opt.log_dir
 else:
-    name = 'model=%s%dx%d-rnn_size=%d-predictor-posterior-rnn_layers=%d-%d-n_cond=%d-lr=%.4f-g_dim=%d-z_dim=%d-last_frame_skip=%d-beta=%.7f%s' % (opt.model, opt.image_width, opt.image_width, opt.rnn_size, opt.predictor_rnn_layers, opt.posterior_rnn_layers, opt.n_cond, opt.lr, opt.g_dim, opt.z_dim, opt.last_frame_skip, opt.beta, opt.name)
+    name = 'model=%s%dx%d-rnn_size=%d-predictor-posterior-rnn_layers=%d-%d-n_cond=%d-lr=%.4f-g_dim=%d-z_dim=%d-last_frame_skip=%d-beta_kld=%.7f-beta_inpaint=%.7f-keyframe_num=%d-pred_horizon=%d-seg_length=%d%s' % (opt.model, opt.image_width, opt.image_width, opt.rnn_size, opt.predictor_rnn_layers, opt.posterior_rnn_layers, opt.n_cond, opt.lr, opt.g_dim, opt.z_dim, opt.last_frame_skip, opt.beta_kld, opt.beta_inpaint, opt.keyframe_num, opt.pred_horizon, opt.seg_length, opt.name)
     if opt.dataset == 'smmnist':
         opt.log_dir = '%s/%s-%d/%s' % (opt.log_dir, opt.dataset, opt.num_digits, name)
     else:
@@ -99,6 +101,8 @@ else:
     raise ValueError('Unknown optimizer: %s' % opt.optimizer)
 
 # ---------------- models ----------------
+import models.lstm as lstm_models
+
 embedder = saved_inpaintor['embedder']
 inpaintor = saved_inpaintor['inpaintor']
 encoder = saved_inpaintor['encoder']
@@ -113,10 +117,7 @@ freeze_parameters(inpaintor)
 freeze_parameters(encoder)
 freeze_parameters(decoder)
 
-
-import models.lstm as lstm_models
-
-if opt.key_model_dir != '':
+if opt.pred_model_dir != '':
     keyframe_conditioner = saved_model['keyframe_conditioner']
     keyframe_predictor = saved_model['keyframe_predictor']
     KeyValue_posterior = saved_model['KeyValue_posterior']
@@ -301,10 +302,11 @@ def train(x):
     keyframe_predictor.hidden = keyframe_predictor.init_hidden()
     KeyValue_posterior.hidden = KeyValue_posterior.init_hidden()
 
-    h_seq = [encoder(x[i]) for i in range(max(opt.n_cond + opt.pred_horizon, opt.n_cond + opt.keyframe_num * opt.seg_length))]
+    h_seq = [encoder(x[i]) for i in range(opt.n_cond + opt.pred_horizon)]
     
     # to pallarelize the computation
     gen_seq = [[] for i in range(opt.keyframe_num + 1)]
+    gen_seq[0] = torch.zeros(opt.seg_length, opt.batch_size, opt.channels, opt.image_width, opt.image_width).cuda()
 
     """
     To condition the keyframe predictor on past frames, 
@@ -331,9 +333,9 @@ def train(x):
         value_logvar_set[index - opt.n_cond] = value_logvar
     
     # change shape to [batch_size, num_keys, key_dim or value_dim]
-    key_set.transpose(0, 1)
-    value_mu_set.transpose(0, 1)
-    value_logvar_set.transpose(0, 1)
+    key_set = torch.stack(key_set).transpose(0, 1)
+    value_mu_set = torch.stack(value_mu_set).transpose(0, 1)
+    value_logvar_set = torch.stack(value_logvar_set).transpose(0, 1)
 
     keyframes = [[] for i in range(opt.keyframe_num + 1)]
     keyframes[0] = x[opt.n_cond - 1]
@@ -346,10 +348,10 @@ def train(x):
     delta_set[0] = torch.zeros(opt.batch_size, opt.seg_length)
 
     # TODO: consider its size
-    index_set = torch.full((opt.keyframe_num + 1, opt.batch_size), fill_value=opt.n_cond-1, dtype=torch.int)
+    index_set = torch.full((opt.keyframe_num + 1, opt.batch_size), fill_value=opt.n_cond-1, dtype=torch.int).cuda()
     
     # generate keyframes and inpaint the frames between them
-    kld_set = [torch.zeros(opt.batch_size)]
+    kld_set = [torch.zeros(opt.batch_size).cuda()]
     for i in range(1, opt.keyframe_num + 1):
         # get the prior distribution of the latent variable
         mu = attention(keyframes_embed[i-1], key_set, value_mu_set)
@@ -369,7 +371,7 @@ def train(x):
 
         # inpaint the frames between the keyframes
         h_cond = torch.cat([keyframes_embed[i-1], keyframes_embed[i], delta_set[i]], 1)
-        inpaintor.hidden = inpaintor.condition(embedder(h_cond))
+        inpaintor.hidden = inpaintor.cond_hidden(embedder(h_cond))
 
         # TODO: consider the index difference between the index_set[i-1] batch
         for j in range(opt.seg_length):
@@ -378,50 +380,74 @@ def train(x):
 
             h = inpaintor(h)
             x_pred = decoder([h, skip])
-            gen_seq.append(x_pred)
+            gen_seq[i].append(x_pred)
+        gen_seq[i] = torch.stack(gen_seq[i])
     
     """
     Convert distributions of interframe offsets δ n to keyframe timesteps τ n
     """
-    tau_set = torch.zeros(opt.keyframe_num + 1, opt.batch_size, opt.pred_horizon)
-    tau_set[1, :, 0:opt.seg_length] = delta_set[1]
+    tau_set = torch.zeros(opt.keyframe_num + 1, opt.batch_size, opt.pred_horizon).cuda()
+    # avoid in-place operation
+    tau_set_new = tau_set.clone()
+    tau_set_new[1, :, 0:opt.seg_length] = delta_set[1]
     for t in range(1, opt.pred_horizon):
         for n in range(2, opt.keyframe_num + 1):
             for j in range(min(opt.seg_length, t)):
-                tau_set[n, :, t] += tau_set[n-1, :, t-1-j] * delta_set[n, :, j]
+                tau_set_new[n, :, t] += tau_set[n-1, :, t-1-j] * delta_set[n][:, j]
+    tau_set = tau_set_new
     
     """
     Compute probabilities of keyframes being within the predicted sequence
     """
-    c_set = torch.zeros(opt.keyframe_num + 1, opt.batch_size)
+    c_set = torch.zeros(opt.keyframe_num + 1, opt.batch_size).cuda()
     for n in range(1, opt.keyframe_num + 1):
         c_set[n] = torch.sum(tau_set[n], dim=1)
 
     """
     Compute soft keyframe targets
     """
-    keyframe_target = [[] for i in opt.keyframe_num + 1]
+    keyframe_target = [[] for i in range(opt.keyframe_num + 1)]
+    keyframe_target[0] = keyframes[0]
     for n in range(1, opt.keyframe_num + 1):
-        keyframe_target[n] = torch.einsum('ib...,bi->b...', x[opt.cond:opt.cond + opt.pred_horizon], tau_set[n])
+        keyframe_target[n] = torch.clamp(torch.einsum('ib...,bi->b...', torch.stack(x[opt.n_cond:opt.n_cond + opt.pred_horizon]), tau_set[n]), min=0.0, max=1.0)
 
     """
     Compute the keyframe loss
+    TODO: The function 'binary_cross_entropy' is not differentiable 
+    with respect to argument 'weight'.  This input cannot have requires_grad True.
     """
-    bce_keyframe = bce_criterion(keyframes, keyframe_target, weight=c_set.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1))
-    kld = torch.sum(kld_set * c_set) / torch.sum(c_set)
+    # bce_criterion = nn.BCELoss(weight=c_set.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1))
+    # bce_keyframe = bce_criterion(torch.stack(keyframes), torch.stack(keyframe_target))
+
+    bce_keyframe = 0
+    for i in range(1, opt.keyframe_num + 1):
+        for b in range(opt.batch_size):
+            bce_keyframe += c_set[i, b] * bce_criterion(keyframes[i][b], keyframe_target[i][b])
+
+    # def weighted_binary_cross_entropy(output, target, weight):
+    #     # TODO: Manually ensure broadcasting and not NAN
+    #     loss = -weight * (target * torch.log(output) + (1 - target) * torch.log(1 - output))
+    #     return loss.mean()
+
+    # bce_keyframe = weighted_binary_cross_entropy(
+    #     torch.stack(keyframes),
+    #     torch.stack(keyframe_target),
+    #     c_set.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1))
+
+    kld = torch.sum(torch.stack(kld_set) * c_set) / torch.sum(c_set)
 
     """
     Get probabilities of segments ending after particular frames
     """
-    p_end = torch.zeros(opt.keyframe_num + 1, opt.batch_size, opt.seg_length)
+    p_end = torch.zeros(opt.keyframe_num + 1, opt.batch_size, opt.seg_length).cuda()
     for n in range(1, opt.keyframe_num + 1):
         for t in range(opt.seg_length):
-            p_end[n, :, t] = torch.sum(delta_set[n, :, t:opt.seg_length], dim=1)
+            p_end[n, :, t] = torch.sum(delta_set[n][:, t:opt.seg_length], dim=1)
     
     """
     Get distributions of individual frames’ timesteps
     """
-    p_frame = torch.zeros(opt.keyframe_num + 1, opt.batch_size, opt.pred_horizon, opt.seg_length)
+    p_frame = torch.zeros(opt.keyframe_num + 1, opt.batch_size, opt.pred_horizon, opt.seg_length).cuda()
     for n in range(1, opt.keyframe_num + 1):
         for t in range(opt.pred_horizon):
             for j in range(min(opt.seg_length, t)):
@@ -430,14 +456,14 @@ def train(x):
     """
     Compute soft individual frames
     """
-    frame_soft = [[] for i in opt.horizon]
+    frame_soft = [[] for i in range(opt.pred_horizon)]
     for i in range(opt.pred_horizon):
-        frame_soft[i] = torch.einsum('nbj,njb...->b...', p_frame[:, :, i, :], gen_seq)
+        frame_soft[i] = torch.clamp(torch.einsum('nbj,njb...->b...', p_frame[:, :, i, :], torch.stack(gen_seq)), min=0.0, max=1.0)
 
     """
     Compute the inpainting loss
     """
-    bce_inpaint = bce_criterion(frame_soft, x[opt.cond:opt.cond + opt.pred_horizon])
+    bce_inpaint = bce_criterion(torch.stack(frame_soft), torch.stack(x[opt.n_cond:opt.n_cond + opt.pred_horizon]))
 
     """
     Compute total sequence loss
@@ -482,9 +508,9 @@ for epoch in range(opt.niter):
     keyframe_conditioner.eval()
     keyframe_predictor.eval()
     KeyValue_posterior.eval()
-    x = next(testing_batch_generator)
-    plot(x, epoch)
-    plot_rec(x, epoch)
+    # x = next(testing_batch_generator)
+    # plot(x, epoch)
+    # plot_rec(x, epoch)
 
     # save the model
     torch.save({

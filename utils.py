@@ -35,7 +35,8 @@ def load_dataset(opt):
                 train=True,
                 data_root=opt.data_root,
                 # seq_len=opt.n_past+opt.n_future,
-                seq_len=opt.seg_length,
+                # seq_len=opt.seg_length,
+                seq_len=opt.n_cond + opt.pred_horizon + 1,
                 image_size=opt.image_width,
                 deterministic=False,
                 num_digits=opt.num_digits)
@@ -43,7 +44,8 @@ def load_dataset(opt):
                 train=False,
                 data_root=opt.data_root,
                 # seq_len=opt.n_eval,
-                seq_len=opt.seg_length,
+                # seq_len=opt.seg_length,
+                seq_len=opt.n_cond + opt.pred_horizon + 1,
                 image_size=opt.image_width,
                 deterministic=False,
                 num_digits=opt.num_digits)

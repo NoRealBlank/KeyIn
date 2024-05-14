@@ -114,7 +114,7 @@ class KeyValue_lstm(nn.Module):
 
 class keyframe_lstm(nn.Module):
     def __init__(self, input_size, output_size, delta_size, hidden_size, n_layers, batch_size):
-        super(lstm, self).__init__()
+        super(keyframe_lstm, self).__init__()
         self.input_size = input_size
         self.output_size = output_size
         self.hidden_size = hidden_size
