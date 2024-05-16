@@ -1,3 +1,3 @@
 # KeyIn
 
-Unofficial implementation of KeyIn: A Key-Frame Extraction Framework for Video Summarization, based on the repository of [SVG](https://github.com/edenton/svg).
+Unofficial implementation of [KeyIn: A Key-Frame Extraction Framework for Video Summarization](https://sites.google.com/view/keyin), based on the repository of [SVG](https://github.com/edenton/svg).
