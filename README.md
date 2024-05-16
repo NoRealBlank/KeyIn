@@ -4,8 +4,8 @@ Unofficial implementation of [KeyIn: A Key-Frame Extraction Framework for Video 
 
 # Inpaintor
 
-use 'train_In.py'
+use `train_In.py`
 
 # Keyframe predictor
 
-use 'train_Key.py'
+use `train_Key.py`
